@@ -1,0 +1,259 @@
+From cbb6b23b2782c69ffed09e7c56b84be6bb4504cf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 21 Aug 2026 03:47:45 +0000
+Subject: [PATCH] fix(config): restringir a http(s) o download da cadeia via
+ AIA
+
+Quando certificate.chain_path nao e informado, o emissor le a extensao
+Authority Information Access do .pfx e baixa cada URL de CA_ISSUERS com
+urlopen(). O opener padrao do urllib entende file:// e ftp://, e a URL vem do
+proprio arquivo de certificado - entrada do usuario, nao do runtime.
+
+Na pratica, um .pfx com AIA apontando para file:///etc/passwd fazia o emissor
+ler o arquivo local, e um AIA apontando para um host interno fazia a
+requisicao sair. Nao havia validacao de esquema, validacao de host, nem teto
+no resp.read(). O comentario "# nosec B310 - trusted CA endpoints from cert"
+silenciava exatamente o alerta que apontaria isso, sobre uma premissa que nao
+se sustenta: o certificado e um arquivo que o operador trata como dado.
+
+A busca agora usa um OpenerDirector montado so com HTTPHandler e HTTPSHandler,
+sem FileHandler e sem FTPHandler - um esquema fora de http(s) falha por
+ausencia de handler, nao por depender de uma checagem que alguem possa remover
+depois. Alem disso: o esquema e validado antes da chamada, redirecionamento
+para fora de http(s) nao e seguido, e a resposta tem teto de 1 MiB.
+
+Cadeias servidas por http(s), que e o caso real das ACs da ICP-Brasil,
+continuam funcionando sem mudanca.
+
+Cinco testes cobrem file://, ftp://, redirecionamento 302 para file://,
+resposta acima do teto, e o caminho feliz com um certificado DER servido por
+HTTP.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/nfe/config.py        |  67 ++++++++++++++++++++--
+ tests/test_config_aia.py | 120 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 183 insertions(+), 4 deletions(-)
+ create mode 100644 tests/test_config_aia.py
+
+diff --git a/src/nfe/config.py b/src/nfe/config.py
+index 5e6636c..604f961 100644
+--- a/src/nfe/config.py
++++ b/src/nfe/config.py
+@@ -3,7 +3,15 @@ from __future__ import annotations
+ import json
+ import os
+ from pathlib import Path
+-from urllib.request import urlopen
++from urllib.parse import urlparse
++from urllib.request import (
++    HTTPDefaultErrorHandler,
++    HTTPErrorProcessor,
++    HTTPHandler,
++    HTTPRedirectHandler,
++    HTTPSHandler,
++    OpenerDirector,
++)
+ 
+ from cryptography import x509
+ from cryptography.hazmat.primitives import hashes
+@@ -62,6 +70,59 @@ def _parse_certificates_from_bytes(raw_bytes: bytes) -> list[x509.Certificate]:
+     return certs
+ 
+ 
++_ALLOWED_AIA_SCHEMES = frozenset({"http", "https"})
++_MAX_AIA_RESPONSE_BYTES = 1 << 20  # 1 MiB; cadeias reais tem alguns KB
++
++
++class _SchemeCheckingRedirectHandler(HTTPRedirectHandler):
++    """Nao segue redirecionamento para fora de http(s)."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
++        if urlparse(newurl).scheme not in _ALLOWED_AIA_SCHEMES:
++            return None
++        return super().redirect_request(req, fp, code, msg, headers, newurl)
++
++
++def _build_aia_opener() -> OpenerDirector:
++    """Opener sem FileHandler e sem FTPHandler.
++
++    O opener padrao do urllib entende file:// e ftp://. Aqui so http(s) existe,
++    entao um esquema fora disso falha por ausencia de handler, e nao por
++    depender de uma checagem que alguem possa remover depois.
++    """
++    opener = OpenerDirector()
++    for handler in (
++        HTTPHandler(),
++        HTTPSHandler(),
++        HTTPDefaultErrorHandler(),
++        HTTPErrorProcessor(),
++        _SchemeCheckingRedirectHandler(),
++    ):
++        opener.add_handler(handler)
++    return opener
++
++
++def _fetch_aia_certificates(url: str) -> list[x509.Certificate]:
++    """Baixa certificados de uma URL de CA_ISSUERS declarada no certificado.
++
++    A URL vem do proprio .pfx, que e entrada do usuario e nao do runtime, entao
++    e tratada como nao confiavel: com o opener padrao, um certificado podia
++    apontar para file:///etc/passwd ou para um host da rede interna e o emissor
++    buscava. So http(s) passa, redirecionamento para outro esquema nao e
++    seguido, e a resposta tem teto de tamanho.
++    """
++    if urlparse(url).scheme not in _ALLOWED_AIA_SCHEMES:
++        return []
++
++    with _build_aia_opener().open(url, timeout=10) as resp:
++        downloaded = resp.read(_MAX_AIA_RESPONSE_BYTES + 1)
++
++    if len(downloaded) > _MAX_AIA_RESPONSE_BYTES:
++        return []
++
++    return _parse_certificates_from_bytes(downloaded)
++
++
+ def _generate_chain_pem_from_pfx(cert_path: Path, password: str) -> Path | None:
+     try:
+         _key, certificate, additional = pkcs12.load_key_and_certificates(
+@@ -90,9 +151,7 @@ def _generate_chain_pem_from_pfx(cert_path: Path, password: str) -> Path | None:
+ 
+         for url in urls:
+             try:
+-                with urlopen(url, timeout=10) as resp:  # nosec B310 - trusted CA endpoints from cert
+-                    downloaded = resp.read()
+-                chain.extend(_parse_certificates_from_bytes(downloaded))
++                chain.extend(_fetch_aia_certificates(url))
+             except Exception:
+                 continue
+ 
+diff --git a/tests/test_config_aia.py b/tests/test_config_aia.py
+new file mode 100644
+index 0000000..d7241ed
+--- /dev/null
++++ b/tests/test_config_aia.py
+@@ -0,0 +1,120 @@
++import http.server
++import socketserver
++import threading
++
++import pytest
++
++from nfe.config import _MAX_AIA_RESPONSE_BYTES, _fetch_aia_certificates
++
++
++class _ReusableServer(socketserver.TCPServer):
++    allow_reuse_address = True
++
++
++def _serve(handler_cls):
++    server = _ReusableServer(("127.0.0.1", 0), handler_cls)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    return server
++
++
++@pytest.fixture
++def http_server():
++    servers = []
++
++    def start(handler_cls):
++        server = _serve(handler_cls)
++        servers.append(server)
++        return f"http://127.0.0.1:{server.server_address[1]}"
++
++    yield start
++
++    for server in servers:
++        server.shutdown()
++        server.server_close()
++
++
++def test_rejects_file_scheme(tmp_path):
++    segredo = tmp_path / "segredo.txt"
++    segredo.write_text("conteudo sensivel", encoding="utf-8")
++
++    assert _fetch_aia_certificates(f"file://{segredo}") == []
++
++
++def test_rejects_ftp_scheme():
++    assert _fetch_aia_certificates("ftp://127.0.0.1/cadeia.p7b") == []
++
++
++def test_does_not_follow_redirect_to_file_scheme(tmp_path, http_server):
++    segredo = tmp_path / "segredo.txt"
++    segredo.write_text("conteudo sensivel", encoding="utf-8")
++
++    class Redirecionador(http.server.BaseHTTPRequestHandler):
++        def do_GET(self):
++            self.send_response(302)
++            self.send_header("Location", f"file://{segredo}")
++            self.end_headers()
++
++        def log_message(self, *args):
++            pass
++
++    base_url = http_server(Redirecionador)
++
++    with pytest.raises(Exception):
++        _fetch_aia_certificates(f"{base_url}/cadeia.p7b")
++
++
++def test_discards_response_above_size_cap(http_server):
++    class Gigante(http.server.BaseHTTPRequestHandler):
++        def do_GET(self):
++            corpo = b"A" * (_MAX_AIA_RESPONSE_BYTES + 1024)
++            self.send_response(200)
++            self.send_header("Content-Length", str(len(corpo)))
++            self.end_headers()
++            self.wfile.write(corpo)
++
++        def log_message(self, *args):
++            pass
++
++    base_url = http_server(Gigante)
++
++    assert _fetch_aia_certificates(f"{base_url}/cadeia.p7b") == []
++
++
++def test_parses_certificate_served_over_http(http_server, tmp_path):
++    from cryptography import x509
++    from cryptography.hazmat.primitives import hashes, serialization
++    from cryptography.hazmat.primitives.asymmetric import rsa
++    from cryptography.x509.oid import NameOID
++    import datetime
++
++    chave = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    nome = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "AC Teste")])
++    agora = datetime.datetime.now(datetime.timezone.utc)
++    certificado = (
++        x509.CertificateBuilder()
++        .subject_name(nome)
++        .issuer_name(nome)
++        .public_key(chave.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(agora - datetime.timedelta(days=1))
++        .not_valid_after(agora + datetime.timedelta(days=365))
++        .sign(chave, hashes.SHA256())
++    )
++    der = certificado.public_bytes(encoding=serialization.Encoding.DER)
++
++    class ServidorDaAC(http.server.BaseHTTPRequestHandler):
++        def do_GET(self):
++            self.send_response(200)
++            self.send_header("Content-Length", str(len(der)))
++            self.end_headers()
++            self.wfile.write(der)
++
++        def log_message(self, *args):
++            pass
++
++    base_url = http_server(ServidorDaAC)
++
++    baixados = _fetch_aia_certificates(f"{base_url}/ac.cer")
++    assert [c.fingerprint(hashes.SHA256()) for c in baixados] == [
++        certificado.fingerprint(hashes.SHA256())
++    ]
+-- 
+2.43.0
+
