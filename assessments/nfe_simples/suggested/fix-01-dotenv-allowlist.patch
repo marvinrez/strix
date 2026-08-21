@@ -1,0 +1,142 @@
+From 8d47ae2e9103e24ae87f91f1fc264fd0c6c16971 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 21 Aug 2026 03:39:50 +0000
+Subject: [PATCH] fix(config): importar do .env apenas as chaves de senha do
+ certificado
+
+_load_dotenv escrevia em os.environ toda chave encontrada no .env lido do
+diretorio do params.json. Como esse diretorio pode vir de terceiro (do
+contador, de um diretorio compartilhado, de um runner de CI), qualquer
+variavel de ambiente podia ser injetada no processo.
+
+O impacto vai alem do escopo pretendido: requests le HTTPS_PROXY,
+REQUESTS_CA_BUNDLE e CURL_CA_BUNDLE em tempo de requisicao, depois que o
+NfseApiClient ja foi construido. Um .env com essas tres linhas desvia o
+trafego para um proxy escolhido pelo atacante e troca a ancora de confianca,
+derrotando a verificacao TLS do canal mTLS com a SEFIN mesmo com
+request.verify_tls: true - a injecao acontece fora do modelo Pydantic, entao
+nenhuma validacao do params.json a alcanca.
+
+Passa a importar apenas CERT_PASSWORD e NFE_CERT_PASSWORD, que sao as unicas
+chaves que o load_params consulta. Comportamento documentado no README fica
+identico; o restante do .env e ignorado.
+
+Testes cobrem os tres casos: chaves fora da allowlist sao ignoradas, ambas as
+chaves de senha funcionam, e o ambiente existente continua tendo precedencia
+sobre o arquivo.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/nfe/config.py    | 17 +++++++++++---
+ tests/test_config.py | 56 +++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/src/nfe/config.py b/src/nfe/config.py
+index 5e6636c..d716c2b 100644
+--- a/src/nfe/config.py
++++ b/src/nfe/config.py
+@@ -19,7 +19,18 @@ class ConfigError(Exception):
+     """Erro de leitura/validacao de configuracao."""
+ 
+ 
++_ALLOWED_ENV_KEYS = frozenset({"CERT_PASSWORD", "NFE_CERT_PASSWORD"})
++
++
+ def _load_dotenv(dotenv_path: Path) -> None:
++    """Importa do .env apenas as chaves de senha do certificado.
++
++    O .env e lido do diretorio do params.json, que pode vir de terceiro (do
++    contador, de um diretorio compartilhado, de um runner de CI). Importar
++    qualquer chave permitiria injetar variaveis que o requests le em tempo de
++    requisicao - HTTPS_PROXY, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE - e assim
++    desviar ou interceptar o canal mTLS com a SEFIN mesmo com verify_tls: true.
++    """
+     if not dotenv_path.exists():
+         return
+ 
+@@ -29,9 +40,9 @@ def _load_dotenv(dotenv_path: Path) -> None:
+             continue
+         key, value = stripped.split("=", 1)
+         key = key.strip()
+-        value = value.strip().strip('"').strip("'")
+-        if key and key not in os.environ:
+-            os.environ[key] = value
++        if key not in _ALLOWED_ENV_KEYS or key in os.environ:
++            continue
++        os.environ[key] = value.strip().strip('"').strip("'")
+ 
+ 
+ def _parse_certificates_from_bytes(raw_bytes: bytes) -> list[x509.Certificate]:
+diff --git a/tests/test_config.py b/tests/test_config.py
+index b94f02f..11ea49e 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -1,6 +1,7 @@
+ import json
++import os
+ 
+-from nfe.config import load_params
++from nfe.config import _load_dotenv, load_params
+ 
+ 
+ def test_load_params_resolves_relative_certificate_path(tmp_path):
+@@ -107,3 +108,56 @@ def test_load_params_preserves_manual_competence_date(tmp_path):
+     loaded = load_params(params_path)
+     assert loaded.dps.issue_date.isoformat() == "2026-05-24"
+     assert loaded.dps.competence_date.isoformat() == "2026-05-01"
++
++
++def test_load_dotenv_ignores_keys_outside_allowlist(tmp_path, monkeypatch):
++    dotenv = tmp_path / ".env"
++    dotenv.write_text(
++        "CERT_PASSWORD=senha-do-certificado\n"
++        "HTTPS_PROXY=http://proxy-do-atacante:9999\n"
++        "REQUESTS_CA_BUNDLE=/tmp/ca-do-atacante.pem\n"
++        "CURL_CA_BUNDLE=/tmp/ca-do-atacante.pem\n"
++        "SSL_CERT_FILE=/tmp/ca-do-atacante.pem\n",
++        encoding="utf-8",
++    )
++    for key in (
++        "CERT_PASSWORD",
++        "HTTPS_PROXY",
++        "REQUESTS_CA_BUNDLE",
++        "CURL_CA_BUNDLE",
++        "SSL_CERT_FILE",
++    ):
++        monkeypatch.delenv(key, raising=False)
++
++    _load_dotenv(dotenv)
++
++    assert os.environ["CERT_PASSWORD"] == "senha-do-certificado"
++    assert "HTTPS_PROXY" not in os.environ
++    assert "REQUESTS_CA_BUNDLE" not in os.environ
++    assert "CURL_CA_BUNDLE" not in os.environ
++    assert "SSL_CERT_FILE" not in os.environ
++
++
++def test_load_dotenv_accepts_both_password_keys(tmp_path, monkeypatch):
++    dotenv = tmp_path / ".env"
++    dotenv.write_text(
++        "# comentario\n"
++        "\n"
++        "NFE_CERT_PASSWORD=senha-alternativa\n",
++        encoding="utf-8",
++    )
++    monkeypatch.delenv("NFE_CERT_PASSWORD", raising=False)
++
++    _load_dotenv(dotenv)
++
++    assert os.environ["NFE_CERT_PASSWORD"] == "senha-alternativa"
++
++
++def test_load_dotenv_does_not_override_existing_environment(tmp_path, monkeypatch):
++    dotenv = tmp_path / ".env"
++    dotenv.write_text("CERT_PASSWORD=senha-do-arquivo\n", encoding="utf-8")
++    monkeypatch.setenv("CERT_PASSWORD", "senha-do-ambiente")
++
++    _load_dotenv(dotenv)
++
++    assert os.environ["CERT_PASSWORD"] == "senha-do-ambiente"
+-- 
+2.43.0
+
