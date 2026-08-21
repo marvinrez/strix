@@ -1,0 +1,9 @@
+# Scripts de pesquisa autocontidos (PoCs de revisões de segurança), fora do pacote
+# strix. Exercitam padrões inseguros de propósito e são feitos para serem lidos e
+# executados à mão, então o conjunto estrito de regras do repositório não se aplica.
+# O ruff resolve a configuração pelo arquivo mais próximo na árvore, então este
+# arquivo cobre tudo sob assessments/.
+line-length = 100
+
+[lint]
+select = ["F"]

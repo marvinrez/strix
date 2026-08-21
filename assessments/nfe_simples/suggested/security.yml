@@ -1,0 +1,82 @@
+# Sugestão de .github/workflows/security.yml para danielcarletti/nfe_simples
+#
+# O repositório não tem CI hoje (achado #9): os testes não rodam automaticamente,
+# não há SCA nem secret scanning. Este workflow cobre os três, e adiciona a
+# varredura diff-scoped do Strix nos pull requests.
+#
+# Segredos necessários para o job do Strix (Settings > Secrets and variables > Actions):
+#   STRIX_LLM     — id do modelo, ex.: anthropic/claude-sonnet-5
+#   LLM_API_KEY   — chave do provedor
+# Sem esses segredos, remova o job `strix`; os demais rodam sozinhos.
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-and-sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[dev]" bandit pip-audit
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Bandit (SAST)
+        run: bandit -r src -ll
+
+      - name: pip-audit (SCA)
+        run: pip-audit --strict
+
+  strix:
+    # Varredura diff-scoped: só o que o PR mudou. Exit 2 = vulnerabilidade validada.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # necessário para resolver o diff
+
+      - name: Install Strix
+        run: curl -sSL https://strix.ai/install | bash
+
+      - name: Run Security Scan
+        env:
+          STRIX_LLM: ${{ secrets.STRIX_LLM }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          strix -n -t ./ --scan-mode quick --max-budget 10 \
+            --diff-base "origin/${{ github.base_ref }}" \
+            --instruction "CLI de emissão fiscal NFS-e. Entradas não confiáveis: params.json, o .env ao lado dele, o arquivo .pfx e as respostas da API SEFIN. Ativos: chave privada do certificado A1 e o canal mTLS. Priorize config.py (carga do .env, download da cadeia AIA) e api_client.py (URL base, verificação de TLS, laço de retry)."
+
+      # Não falhar aberto: um run que estoura o orçamento sai 0 com status "stopped".
+      - name: Fail unless the scan completed
+        run: |
+          run_json=$(ls -t strix_runs/*/run.json | head -1)
+          status=$(jq -r .status "$run_json")
+          if [ "$status" != "completed" ]; then
+            echo "Strix run status is '$status' — scan incompleto (provável estouro de orçamento). Aumente --max-budget." >&2
+            exit 1
+          fi
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: strix_runs
