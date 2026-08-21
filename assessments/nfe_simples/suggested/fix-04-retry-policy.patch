@@ -1,0 +1,224 @@
+From 78a002e006cd025ea709f952cf11357e32e554a3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 21 Aug 2026 12:54:23 +0000
+Subject: [PATCH] fix(api_client): nao repetir POST /nfse e adicionar backoff
+
+O laco de retry em _request repetia qualquer metodo diante de qualquer
+requests.RequestException. Acontece que essa excecao nao distingue "nao chegou
+ao servidor" de "chegou, foi processada, e a resposta se perdeu na volta" -
+ReadTimeout e conexao encerrada cobrem os dois casos.
+
+No segundo caso, repetir o POST /nfse emite a mesma nota outra vez. Com o
+padrao retries: 1 sao duas emissoes; com o maximo permitido, seis. O custo nao
+e uma requisicao perdida: e uma NFS-e a mais, com numero de DPS ja consumido e
+cancelamento manual pela frente.
+
+POST passa a ir uma vez so. GET, HEAD e OPTIONS continuam sendo repetidos ate
+request.retries, agora com backoff exponencial em vez de reenvio imediato.
+
+Quatro testes cobrem POST nao repetido quando a resposta se perde, GET e HEAD
+repetidos ate o limite, e POST bem-sucedido inalterado.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/nfe/api_client.py      |  22 ++++++-
+ tests/test_retry_policy.py | 132 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 152 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_retry_policy.py
+
+diff --git a/src/nfe/api_client.py b/src/nfe/api_client.py
+index 6378836..fa14e56 100644
+--- a/src/nfe/api_client.py
++++ b/src/nfe/api_client.py
+@@ -4,6 +4,7 @@ import base64
+ import gzip
+ import json
+ import tempfile
++import time
+ from pathlib import Path
+ 
+ import requests
+@@ -13,6 +14,13 @@ from cryptography.hazmat.primitives.serialization import pkcs12
+ from .models import NfseParams
+ 
+ 
++# Metodos seguros de repetir: reexecutar nao cria nem altera recurso no servidor.
++# POST /nfse fica de fora de proposito - ver _request.
++IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
++
++RETRY_BACKOFF_SECONDS = 0.5
++
++
+ DEFAULT_BASE_URLS = {
+     "producao_restrita": "https://sefin.producaorestrita.nfse.gov.br/SefinNacional",
+     "producao": "https://sefin.nfse.gov.br/SefinNacional",
+@@ -110,16 +118,26 @@ class NfseApiClient:
+                 Path(file_path).unlink(missing_ok=True)
+ 
+     def _request(self, method: str, path: str, **kwargs) -> dict:
++        """Executa a requisicao, repetindo apenas metodos idempotentes.
++
++        Uma requests.RequestException nao distingue "nao chegou ao servidor" de
++        "chegou, foi processada, e a resposta se perdeu na volta" - ReadTimeout e
++        conexao encerrada cobrem os dois casos. Repetir um POST /nfse nessa
++        situacao emite a mesma nota de novo, com numero de DPS ja consumido e
++        cancelamento manual pela frente. Entao POST vai uma vez so.
++        """
+         url = f"{self.base_url}{path}"
+         last_exc: Exception | None = None
+-        attempts = self.retries + 1
++        attempts = self.retries + 1 if method.upper() in IDEMPOTENT_METHODS else 1
+ 
+-        for _ in range(attempts):
++        for attempt in range(attempts):
+             try:
+                 resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                 return _normalize_response(resp)
+             except requests.RequestException as exc:
+                 last_exc = exc
++                if attempt + 1 < attempts:
++                    time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+ 
+         raise ApiClientError(f"Falha de comunicacao em {method} {url}: {last_exc}") from last_exc
+ 
+diff --git a/tests/test_retry_policy.py b/tests/test_retry_policy.py
+new file mode 100644
+index 0000000..f38cd69
+--- /dev/null
++++ b/tests/test_retry_policy.py
+@@ -0,0 +1,132 @@
++import http.server
++import json
++import socketserver
++import threading
++
++import pytest
++
++from nfe.api_client import ApiClientError, NfseApiClient
++from nfe.models import NfseParams
++
++
++def _params(retries: int) -> NfseParams:
++    return NfseParams.model_validate(
++        {
++            "environment": "producao_restrita",
++            "certificate": {"path": "./certificado.pfx", "password": "123"},
++            "issuer": {"tax_id": "12345678000199", "name": "Prestador"},
++            "service_taker": {
++                "tax_id": None,
++                "name": "Tomador Estrangeiro",
++                "is_foreign": True,
++                "country_code": "US",
++                "city": "San Francisco",
++                "street": "Market Street",
++                "number": "2261",
++            },
++            "service": {"description": "Servico", "amount": "10.00"},
++            "dps": {
++                "municipality_code": "3550308",
++                "series": "70000",
++                "number": "1",
++                "issue_date": "2026-05-24",
++                "competence_date": "2026-05-24",
++            },
++            "request": {"retries": retries, "timeout_seconds": 2},
++        }
++    )
++
++
++class _ReusableServer(socketserver.TCPServer):
++    allow_reuse_address = True
++
++
++@pytest.fixture
++def servidor_que_perde_a_resposta():
++    """Processa a requisicao e derruba a conexao antes de responder."""
++    recebidas = []
++
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def _registrar_e_derrubar(self):
++            tamanho = int(self.headers.get("content-length", 0))
++            if tamanho:
++                self.rfile.read(tamanho)
++            recebidas.append((self.command, self.path))
++            self.close_connection = True
++
++        do_POST = _registrar_e_derrubar
++        do_GET = _registrar_e_derrubar
++        do_HEAD = _registrar_e_derrubar
++
++        def log_message(self, *args):
++            pass
++
++    server = _ReusableServer(("127.0.0.1", 0), Handler)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    yield f"http://127.0.0.1:{server.server_address[1]}", recebidas
++    server.shutdown()
++    server.server_close()
++
++
++def _cliente(base_url: str, retries: int) -> NfseApiClient:
++    params = _params(retries)
++    client = NfseApiClient(params)
++    client.base_url = base_url  # evita exigir um .pfx real neste teste
++    return client
++
++
++def test_post_nao_e_repetido_quando_a_resposta_se_perde(servidor_que_perde_a_resposta):
++    base_url, recebidas = servidor_que_perde_a_resposta
++    client = _cliente(base_url, retries=3)
++
++    with pytest.raises(ApiClientError):
++        client.emit_nfse(b"<DPS>nota-unica</DPS>")
++
++    assert [metodo for metodo, _ in recebidas] == ["POST"]
++
++
++def test_get_e_repetido_ate_o_limite(servidor_que_perde_a_resposta):
++    base_url, recebidas = servidor_que_perde_a_resposta
++    client = _cliente(base_url, retries=2)
++
++    with pytest.raises(ApiClientError):
++        client.get_by_dps_id("355030821234567800019910000000000000001")
++
++    assert [metodo for metodo, _ in recebidas] == ["GET", "GET", "GET"]
++
++
++def test_head_e_repetido_ate_o_limite(servidor_que_perde_a_resposta):
++    base_url, recebidas = servidor_que_perde_a_resposta
++    client = _cliente(base_url, retries=1)
++
++    with pytest.raises(ApiClientError):
++        client.head_by_dps_id("355030821234567800019910000000000000001")
++
++    assert [metodo for metodo, _ in recebidas] == ["HEAD", "HEAD"]
++
++
++def test_post_bem_sucedido_continua_funcionando():
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def do_POST(self):
++            tamanho = int(self.headers.get("content-length", 0))
++            self.rfile.read(tamanho)
++            corpo = json.dumps({"nfseId": "abc"}).encode()
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(corpo)))
++            self.end_headers()
++            self.wfile.write(corpo)
++
++        def log_message(self, *args):
++            pass
++
++    server = _ReusableServer(("127.0.0.1", 0), Handler)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    try:
++        client = _cliente(f"http://127.0.0.1:{server.server_address[1]}", retries=1)
++        resultado = client.emit_nfse(b"<DPS>nota</DPS>")
++        assert resultado["ok"] is True
++        assert resultado["payload"] == {"nfseId": "abc"}
++    finally:
++        server.shutdown()
++        server.server_close()
+-- 
+2.43.0
+

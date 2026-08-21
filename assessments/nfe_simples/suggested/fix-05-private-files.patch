@@ -1,0 +1,354 @@
+From a75d728214ffd6f61b6e26c9a5b4efb0fe0f3b50 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 21 Aug 2026 12:56:36 +0000
+Subject: [PATCH] fix(api_client,cli): restringir permissoes do material
+ sensivel em disco
+
+Dois pontos gravavam dado sensivel com permissao mais aberta do que precisa.
+
+O primeiro sao os arquivos de mTLS. A chave privada do A1 sai do .pfx em
+PKCS#8 sem criptografia, porque o requests precisa dela assim, e ia para dois
+NamedTemporaryFile soltos em /tmp - que e world-writable - removidos so no
+__exit__. Se o processo caisse, ou se o NfseApiClient fosse usado sem o with,
+a chave ficava em disco. Agora vao para um diretorio proprio criado com
+mkdtemp (0700), com os arquivos em 0600, removidos no __exit__, no atexit do
+processo, e tambem se a extracao falhar no meio.
+
+O segundo sao as saidas. cli.py criava results/ e gravava com o modo do umask,
+tipicamente 0755 e 0644 - a DPS assinada, com CNPJ, valores e dados do tomador,
+e o resultado.json ficavam legiveis por qualquer usuario da maquina. Passam a
+0700 e 0600.
+
+Nota sobre _mkdir_private: mkdir(parents=True) aplica o modo so ao ultimo
+nivel, entao os intermediarios sairiam com o padrao do umask. A funcao cria um
+nivel por vez, e so os que faltam, para nao alterar o modo de diretorios que ja
+existiam por outro motivo.
+
+Cinco testes cobrem os modos dos arquivos de mTLS, a remocao do diretorio ao
+sair do contexto, senha errada nao deixando diretorio para tras, os modos das
+saidas do CLI, e um results/ preexistente em 0755 sendo corrigido.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/nfe/api_client.py       |  60 +++++++++++-----
+ src/nfe/cli.py              |  29 ++++++--
+ tests/test_private_files.py | 134 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 203 insertions(+), 20 deletions(-)
+ create mode 100644 tests/test_private_files.py
+
+diff --git a/src/nfe/api_client.py b/src/nfe/api_client.py
+index 6378836..247b7a5 100644
+--- a/src/nfe/api_client.py
++++ b/src/nfe/api_client.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+ 
++import atexit
+ import base64
+ import gzip
+ import json
++import shutil
+ import tempfile
+ from pathlib import Path
+ 
+@@ -25,7 +27,17 @@ class ApiClientError(Exception):
+ 
+ def _extract_mutual_tls_files(
+     pfx_path: str, password: str, chain_path: str | None = None
+-) -> tuple[str, str]:
++) -> tuple[str, str, str]:
++    """Extrai certificado e chave do .pfx para arquivos que o requests possa ler.
++
++    A chave sai em PKCS#8 sem criptografia, porque o requests precisa dela assim.
++    Por isso os arquivos vao para um diretorio proprio criado com mkdtemp (0700) e
++    nao soltos em /tmp, que e world-writable, e sao removidos no __exit__ do
++    cliente e tambem no encerramento do processo, para nao deixar a chave privada
++    do A1 em disco se algo falhar no meio do caminho.
++
++    Devolve (caminho do certificado, caminho da chave, diretorio temporario).
++    """
+     pfx_bytes = Path(pfx_path).read_bytes()
+     private_key, certificate, additional = pkcs12.load_key_and_certificates(
+         pfx_bytes, password.encode("utf-8")
+@@ -45,15 +57,20 @@ def _extract_mutual_tls_files(
+         cert_pem_parts.append(Path(chain_path).read_bytes())
+     cert_pem = b"\n".join(cert_pem_parts)
+ 
+-    cert_file = tempfile.NamedTemporaryFile(prefix="nfe-cert-", suffix=".pem", delete=False)
+-    key_file = tempfile.NamedTemporaryFile(prefix="nfe-key-", suffix=".pem", delete=False)
+-    cert_file.write(cert_pem)
+-    key_file.write(key_pem)
+-    cert_file.flush()
+-    key_file.flush()
+-    cert_file.close()
+-    key_file.close()
+-    return cert_file.name, key_file.name
++    temp_dir = tempfile.mkdtemp(prefix="nfe-mtls-")
++    atexit.register(shutil.rmtree, temp_dir, ignore_errors=True)
++    try:
++        cert_file = Path(temp_dir) / "client-cert.pem"
++        key_file = Path(temp_dir) / "client-key.pem"
++        cert_file.write_bytes(cert_pem)
++        key_file.write_bytes(key_pem)
++        cert_file.chmod(0o600)
++        key_file.chmod(0o600)
++    except Exception:
++        shutil.rmtree(temp_dir, ignore_errors=True)
++        raise
++
++    return str(cert_file), str(key_file), temp_dir
+ 
+ 
+ def _normalize_response(resp: requests.Response) -> dict:
+@@ -89,25 +106,36 @@ class NfseApiClient:
+ 
+         self._cert_file: str | None = None
+         self._key_file: str | None = None
++        self._temp_dir: str | None = None
+         self.session = requests.Session()
+ 
+     def __enter__(self) -> "NfseApiClient":
+-        cert_file, key_file = _extract_mutual_tls_files(
++        cert_file, key_file, temp_dir = _extract_mutual_tls_files(
+             self.params.certificate.path,
+             self.params.certificate.password,
+             self.params.certificate.chain_path,
+         )
+         self._cert_file = cert_file
+         self._key_file = key_file
+-        self.session.cert = (cert_file, key_file)
+-        self.session.verify = self.verify_tls
++        self._temp_dir = temp_dir
++        try:
++            self.session.cert = (cert_file, key_file)
++            self.session.verify = self.verify_tls
++        except Exception:
++            self._cleanup_temp_dir()
++            raise
+         return self
+ 
+     def __exit__(self, exc_type, exc, tb) -> None:
+         self.session.close()
+-        for file_path in (self._cert_file, self._key_file):
+-            if file_path:
+-                Path(file_path).unlink(missing_ok=True)
++        self._cleanup_temp_dir()
++
++    def _cleanup_temp_dir(self) -> None:
++        if self._temp_dir:
++            shutil.rmtree(self._temp_dir, ignore_errors=True)
++            self._temp_dir = None
++        self._cert_file = None
++        self._key_file = None
+ 
+     def _request(self, method: str, path: str, **kwargs) -> dict:
+         url = f"{self.base_url}{path}"
+diff --git a/src/nfe/cli.py b/src/nfe/cli.py
+index c37abce..cfdacc8 100644
+--- a/src/nfe/cli.py
++++ b/src/nfe/cli.py
+@@ -10,6 +10,27 @@ from .config import ConfigError, load_params
+ from .dps_builder import build_dps_identifier, build_dps_xml
+ from .xml_signer import XmlSignatureError, sign_dps_xml
+ 
++# A DPS assinada e o resultado carregam CNPJ, valores e dados do tomador. Sao
++# gravados so para o dono do processo, em vez do 0755/0644 que o umask daria.
++PRIVATE_DIR_MODE = 0o700
++PRIVATE_FILE_MODE = 0o600
++
++
++def _mkdir_private(path: Path) -> None:
++    # mkdir(parents=True) aplica o modo so ao ultimo nivel; os intermediarios
++    # sairiam com o padrao do umask. Cria um nivel por vez, e so os que faltam,
++    # para nao mexer no modo de diretorios que ja existiam.
++    faltantes = [candidato for candidato in (path, *path.parents) if not candidato.exists()]
++    for candidato in reversed(faltantes):
++        candidato.mkdir(mode=PRIVATE_DIR_MODE)
++        candidato.chmod(PRIVATE_DIR_MODE)
++    path.chmod(PRIVATE_DIR_MODE)
++
++
++def _write_private(path: Path, data: bytes) -> None:
++    path.write_bytes(data)
++    path.chmod(PRIVATE_FILE_MODE)
++
+ 
+ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+     parser = argparse.ArgumentParser(description="Emissor NFS-e via API Contribuintes")
+@@ -37,13 +58,13 @@ def run(argv: list[str] | None = None) -> int:
+ 
+     try:
+         results_dir = Path("results")
+-        results_dir.mkdir(parents=True, exist_ok=True)
++        _mkdir_private(results_dir)
+ 
+         params = load_params(args.params)
+         dps_id = build_dps_identifier(params)
+         folder_prefix = params.dps.issue_date.isoformat()
+         nf_results_dir = results_dir / f"{folder_prefix}_{dps_id}"
+-        nf_results_dir.mkdir(parents=True, exist_ok=True)
++        _mkdir_private(nf_results_dir)
+         output_json = nf_results_dir / (
+             Path(args.output_json).name if args.output_json else "resultado.json"
+         )
+@@ -65,7 +86,7 @@ def run(argv: list[str] | None = None) -> int:
+                 "sign_xml": "ok",
+             },
+         }
+-        output_xml.write_bytes(signed_xml)
++        _write_private(output_xml, signed_xml)
+         result["signed_xml_path"] = str(output_xml.resolve())
+ 
+         with NfseApiClient(params) as api:
+@@ -79,7 +100,7 @@ def run(argv: list[str] | None = None) -> int:
+         result["result_json_path"] = str(output_json.resolve())
+         serialized = json.dumps(result, ensure_ascii=True, indent=2, default=str)
+         print(serialized)
+-        output_json.write_text(serialized + "\n", encoding="utf-8")
++        _write_private(output_json, (serialized + "\n").encode("utf-8"))
+ 
+         return 0 if result["emit"].get("ok") else 2
+ 
+diff --git a/tests/test_private_files.py b/tests/test_private_files.py
+new file mode 100644
+index 0000000..c3b8c84
+--- /dev/null
++++ b/tests/test_private_files.py
+@@ -0,0 +1,134 @@
++import datetime
++import os
++import stat
++from pathlib import Path
++
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.hazmat.primitives.serialization import pkcs12
++from cryptography.x509.oid import NameOID
++
++from nfe.api_client import _extract_mutual_tls_files
++from nfe.cli import PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, _mkdir_private, _write_private
++
++somente_posix = pytest.mark.skipif(os.name == "nt", reason="modos POSIX")
++
++SENHA = "senha-de-teste"
++
++
++@pytest.fixture
++def pfx(tmp_path) -> str:
++    chave = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    nome = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "EMPRESA TESTE")])
++    agora = datetime.datetime.now(datetime.timezone.utc)
++    certificado = (
++        x509.CertificateBuilder()
++        .subject_name(nome)
++        .issuer_name(nome)
++        .public_key(chave.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(agora - datetime.timedelta(days=1))
++        .not_valid_after(agora + datetime.timedelta(days=365))
++        .sign(chave, hashes.SHA256())
++    )
++    caminho = tmp_path / "certificado.pfx"
++    caminho.write_bytes(
++        pkcs12.serialize_key_and_certificates(
++            b"teste",
++            chave,
++            certificado,
++            None,
++            serialization.BestAvailableEncryption(SENHA.encode()),
++        )
++    )
++    return str(caminho)
++
++
++def _modo(caminho) -> int:
++    return stat.S_IMODE(os.stat(caminho).st_mode)
++
++
++@somente_posix
++def test_arquivos_mtls_ficam_em_diretorio_privado(pfx):
++    cert, key, temp_dir = _extract_mutual_tls_files(pfx, SENHA)
++    try:
++        assert _modo(temp_dir) == 0o700
++        assert _modo(cert) == 0o600
++        assert _modo(key) == 0o600
++        assert Path(cert).parent == Path(temp_dir)
++        assert Path(key).parent == Path(temp_dir)
++    finally:
++        import shutil
++
++        shutil.rmtree(temp_dir, ignore_errors=True)
++
++
++def test_diretorio_temporario_some_ao_sair_do_contexto(pfx):
++    from nfe.api_client import NfseApiClient
++    from nfe.models import NfseParams
++
++    params = NfseParams.model_validate(
++        {
++            "environment": "producao_restrita",
++            "certificate": {"path": pfx, "password": SENHA},
++            "issuer": {"tax_id": "12345678000199", "name": "Prestador"},
++            "service_taker": {
++                "tax_id": None,
++                "name": "Tomador Estrangeiro",
++                "is_foreign": True,
++                "country_code": "US",
++                "city": "San Francisco",
++                "street": "Market Street",
++                "number": "2261",
++            },
++            "service": {"description": "Servico", "amount": "10.00"},
++            "dps": {
++                "municipality_code": "3550308",
++                "series": "70000",
++                "number": "1",
++                "issue_date": "2026-05-24",
++                "competence_date": "2026-05-24",
++            },
++        }
++    )
++
++    with NfseApiClient(params) as cliente:
++        temp_dir = cliente._temp_dir
++        assert Path(temp_dir).is_dir()
++        assert _modo(temp_dir) == 0o700
++
++    assert not Path(temp_dir).exists()
++
++
++def test_senha_errada_nao_deixa_diretorio_para_tras(pfx, tmp_path):
++    antes = set(Path(os.environ.get("TMPDIR", "/tmp")).glob("nfe-mtls-*"))
++    with pytest.raises(Exception):
++        _extract_mutual_tls_files(pfx, "senha-errada")
++    depois = set(Path(os.environ.get("TMPDIR", "/tmp")).glob("nfe-mtls-*"))
++    assert depois == antes
++
++
++@somente_posix
++def test_saidas_do_cli_sao_privadas(tmp_path):
++    destino = tmp_path / "results" / "2026-05-24_355030821234567800019910000000000000001"
++    _mkdir_private(destino)
++    arquivo = destino / "dps-assinada.xml"
++    _write_private(arquivo, b"<DPS>CNPJ e dados do tomador</DPS>")
++
++    assert _modo(destino) == PRIVATE_DIR_MODE
++    assert _modo(destino.parent) == PRIVATE_DIR_MODE
++    assert _modo(arquivo) == PRIVATE_FILE_MODE
++
++
++@somente_posix
++def test_diretorio_de_results_preexistente_e_corrigido(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    frouxo = tmp_path / "results"
++    frouxo.mkdir(mode=0o755)
++    assert _modo(frouxo) == 0o755
++
++    _mkdir_private(frouxo)
++
++    assert _modo(frouxo) == PRIVATE_DIR_MODE
+-- 
+2.43.0
+
