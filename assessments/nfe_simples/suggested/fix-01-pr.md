@@ -72,3 +72,7 @@ Três testes de regressão: chaves fora da allowlist são ignoradas, ambas as ch
 - **O parsing do `.env`** (`value.strip().strip('"').strip("'")`) remove aspas repetidas das duas pontas: uma senha `"Ab#123""` é lida como `Ab#123`. É um bug real, mas independente deste — não misturei.
 
 Achei isto numa revisão de segurança do repositório. Há outros achados, com PoC, que posso abrir como issues separadas se for útil.
+
+---
+
+Revisao feita com [Strix](https://github.com/usestrix/strix), ferramenta open source de pentest por IA, com apoio do Claude. Cada achado tem prova de conceito executavel e teste de regressao. Relatorio completo, com os PoCs: https://github.com/marvinrez/strix/tree/claude/nfe-simples-security-cq5llr/assessments/nfe_simples

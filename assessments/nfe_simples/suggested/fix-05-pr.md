@@ -62,3 +62,7 @@ Cinco casos em `tests/test_private_files.py`: modos dos arquivos de mTLS, remoç
 Suíte completa: 12 passando.
 
 Quinto de alguns achados de uma revisão de segurança do repositório.
+
+---
+
+Revisao feita com [Strix](https://github.com/usestrix/strix), ferramenta open source de pentest por IA, com apoio do Claude. Cada achado tem prova de conceito executavel e teste de regressao. Relatorio completo, com os PoCs: https://github.com/marvinrez/strix/tree/claude/nfe-simples-security-cq5llr/assessments/nfe_simples

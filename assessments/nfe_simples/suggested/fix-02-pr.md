@@ -67,3 +67,7 @@ Suíte completa: 12 passando.
 Tornar a busca opt-in (`certificate.fetch_chain: false` por padrão, com `chain_path` como caminho documentado) seria mais conservador ainda — buscar cadeia na rede é conveniência, não requisito. Não fiz porque quebraria quem hoje depende do comportamento automático. Fica como sugestão, se você achar que vale.
 
 Este é o segundo de alguns achados de uma revisão de segurança do repositório. O primeiro está em #<número do PR anterior>.
+
+---
+
+Revisao feita com [Strix](https://github.com/usestrix/strix), ferramenta open source de pentest por IA, com apoio do Claude. Cada achado tem prova de conceito executavel e teste de regressao. Relatorio completo, com os PoCs: https://github.com/marvinrez/strix/tree/claude/nfe-simples-security-cq5llr/assessments/nfe_simples

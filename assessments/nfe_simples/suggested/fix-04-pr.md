@@ -70,3 +70,7 @@ Isso muda a assinatura de `emit_nfse` e toca o `cli.py`, então fica melhor como
 Quatro casos em `tests/test_retry_policy.py`: POST não repetido quando a resposta se perde, `GET` e `HEAD` repetidos até o limite, e POST bem-sucedido inalterado. Suíte completa: 11 passando.
 
 Quarto de alguns achados de uma revisão de segurança do repositório.
+
+---
+
+Revisao feita com [Strix](https://github.com/usestrix/strix), ferramenta open source de pentest por IA, com apoio do Claude. Cada achado tem prova de conceito executavel e teste de regressao. Relatorio completo, com os PoCs: https://github.com/marvinrez/strix/tree/claude/nfe-simples-security-cq5llr/assessments/nfe_simples
